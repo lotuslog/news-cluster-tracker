@@ -1,0 +1,5 @@
+playwright==1.44.0
+beautifulsoup4==4.12.3
+google-cloud-bigquery==3.20.1
+google-auth==2.29.0
+pytz==2024.1

@@ -1,7 +1,7 @@
 """
 네이버 뉴스 클러스터 크롤러 — 이벤트 기반 버전
 - 테이블: article_master / cluster_master / cluster_article_events
-- 적재 방식: 진입(enter) / 이탈(exit) 이벤트만 append
+- 적재 방식: 진입(enter) / 이탈(exit) 이벤트만 append (스냅샷 방식 폐기)
 - 중복 방지: 현재 활성 기사 목록을 BQ에서 조회 후 diff
 - 로그: stdout (Actions 콘솔에서 바로 확인)
 """
@@ -49,7 +49,9 @@ HEADLESS              = True
 PAGE_TIMEOUT          = 20_000
 CLICK_DELAY           = 1.0
 BETWEEN_CLUSTER_DELAY = 1.2
-MAX_MORE_CLICKS       = 15  # "기사 더보기" 최대 반복 클릭 횟수 (대형 클러스터 전체 로드 보장용 안전 상한)
+MAX_MORE_CLICKS       = 15     # "기사 더보기" 최대 반복 클릭 횟수 (대형 클러스터 전체 로드 보장용 안전 상한)
+MORE_BTN_CLICK_TIMEOUT = 3_000  # 더보기 버튼 클릭 전용 타임아웃(ms) — PAGE_TIMEOUT(20초)보다 훨씬 짧게
+                                # 줘서, 버튼이 안 보이는 경우(더 보여줄 기사가 없음) 빠르게 다음으로 넘어간다
 
 # ─────────────────────────────────────────────
 # [추가] URL 정형화 유틸 
@@ -382,16 +384,28 @@ def crawl_cluster(page, cluster_id: str, cluster_url: str,
     # 다음 사이클에 다시 enter로 잡히는 "깜빡임" 버그가 발생했다 (한 클러스터에서
     # 96~100개 기사가 동시에 enter/exit하는 패턴으로 확인됨).
     # → 버튼이 더 이상 보이지 않을 때까지(최대 MAX_MORE_CLICKS회) 반복 클릭한다.
+    #
+    # [추가 수정] count()는 DOM에 존재하는지만 보고, 화면에 실제로 보이는지는
+    # 보지 않는다. 그래서 기사가 적어 더보기가 더 필요 없는 클러스터에서
+    # "버튼은 DOM에 남아있지만 보이지 않는(element is not visible)" 상태가 되면,
+    # click()이 기본 타임아웃(PAGE_TIMEOUT=20초)까지 계속 재시도하다 실패해서
+    # 클러스터마다 불필요하게 20초씩 허비했다. is_visible()로 먼저 보이는지
+    # 확인하고, 클릭 자체의 타임아웃도 짧게(MORE_BTN_CLICK_TIMEOUT) 줘서
+    # 안 보이면 즉시 다음으로 넘어가도록 한다.
     more_click_count = 0
     more_click_failed = False
     for _ in range(MAX_MORE_CLICKS):
         try:
-            more_btn = page.locator("a:has-text('기사 더보기'), button:has-text('기사 더보기')")
-            if more_btn.count() == 0:
+            more_btn = page.locator("a:has-text('기사 더보기'), button:has-text('기사 더보기')").first
+            if more_btn.count() == 0 or not more_btn.is_visible():
                 break
-            more_btn.first.click()
+            more_btn.click(timeout=MORE_BTN_CLICK_TIMEOUT)
             more_click_count += 1
             time.sleep(CLICK_DELAY)
+        except PlaywrightTimeout:
+            # 버튼이 안 보이거나 클릭이 막혀 있는 경우 — 더 이상 보여줄 기사가
+            # 없는 정상적인 상황일 가능성이 높으므로 warning 없이 조용히 종료
+            break
         except Exception as e:
             log.warning(f"  [{cluster_id}] 더보기 클릭 실패 ({more_click_count}번째 시도): {e}")
             more_click_failed = True
@@ -622,7 +636,15 @@ def main():
     import pytz
     KST = pytz.timezone("Asia/Seoul")
     start = datetime.now(KST)
-    
+
+    # [수정] 기존에는 KST 기준 시각을 타임존 정보 없는 문자열
+    # ("%Y-%m-%d %H:%M:%S")로 만들어 BigQuery TIMESTAMP 컬럼에 넣었다.
+    # BigQuery는 타임존 정보가 없는 문자열을 받으면 UTC로 간주해 저장하므로,
+    # 실제로는 KST 시각인데 그 값이 그대로 UTC로 찍혀 9시간이 어긋나는
+    # 문제가 있었다 (예: 실제 한국시간 09:00이 "09:00 UTC"로 저장되어
+    # 조회 시 실제로는 한국시간 18:00을 가리키게 됨).
+    # → UTC로 명시적으로 변환한 ISO 8601 문자열(타임존 오프셋 포함)을 사용해
+    # BigQuery가 절대 헷갈리지 않도록 한다.
     now_str = start.astimezone(pytz.utc).isoformat()
 
     if TARGET_SECTION:
@@ -644,6 +666,7 @@ def main():
     cluster_id = table_ids[TBL_CLUSTER]
     events_id  = table_ids[TBL_EVENTS]
 
+    # [변경] 기존의 테이블 전체 로드(Full Scan) 방식을 폐기하고 섹션별 루프 내에서 처리하도록 변경합니다.
     total_enter = total_exit = 0
     had_error = False  # [추가] 섹션 처리 중 예외가 한 번이라도 발생했는지 추적
 

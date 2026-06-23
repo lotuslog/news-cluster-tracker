@@ -1,12 +1,12 @@
 name: 클러스터 수집
-
+ 
 on:
   workflow_dispatch:
-
+ 
 concurrency:
   group: crawl-job
   cancel-in-progress: true
-
+ 
 jobs:
   crawl:
     runs-on: ubuntu-22.04
@@ -15,39 +15,23 @@ jobs:
       matrix:
         section: ["정치,100", "경제,101", "사회,102", "생활/문화,103", "세계,104", "IT/과학,105"]
       fail-fast: false
-
+ 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+ 
       - name: Python 3.11 설정
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
+ 
       - name: 패키지 설치
         run: pip install -r requirements.txt
-
-      - name: Playwright 버전 확인 (캐시 키용)
-        id: pw-version
-        run: echo "version=$(pip show playwright | grep Version | cut -d' ' -f2)" >> $GITHUB_OUTPUT
-
-      - name: Playwright 브라우저 캐시 복원
-        id: pw-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
-
-      - name: Playwright Chromium 설치 (캐시 미스 시에만)
-        if: steps.pw-cache.outputs.cache-hit != 'true'
+ 
+      - name: Playwright Chromium 설치
         run: playwright install --with-deps chromium
-
-      - name: Playwright 시스템 의존성만 설치 (캐시 히트 시)
-        if: steps.pw-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
-
+ 
       - name: 크롤러 실행
         env:
           GCP_SA_JSON:    ${{ secrets.GCP_SA_JSON }}

@@ -556,6 +556,7 @@ def main():
 
     # [변경] 기존의 테이블 전체 로드(Full Scan) 방식을 폐기하고 섹션별 루프 내에서 처리하도록 변경합니다.
     total_enter = total_exit = 0
+    had_error = False  # [추가] 섹션 처리 중 예외가 한 번이라도 발생했는지 추적
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=HEADLESS)
@@ -611,6 +612,7 @@ def main():
 
             except Exception as e:
                 log.error(f"[{section_name}] 예외 발생: {e}", exc_info=True)
+                had_error = True  # [추가] 실패를 기록 — 워크플로우가 조용히 성공 처리되는 것을 방지
                 continue
 
         browser.close()
@@ -619,6 +621,14 @@ def main():
     log.info("\n" + "=" * 60)
     log.info(f"완료: enter {total_enter}건 / exit {total_exit}건 / 소요 {elapsed}초")
     log.info("=" * 60)
+
+    # [추가] 섹션 처리 중 예외가 있었다면, GitHub Actions가 이 실행을 "실패"로 인식하도록
+    # 명시적으로 비정상 종료한다. 이게 없으면 try/except의 continue로 인해
+    # main()이 끝까지 정상 실행되어 exit code 0(성공)으로 보고되고,
+    # 실패 메일 알림(notify job)이 영원히 트리거되지 않는다.
+    if had_error:
+        log.error("하나 이상의 섹션에서 예외가 발생하여 비정상 종료(exit 1) 처리합니다.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

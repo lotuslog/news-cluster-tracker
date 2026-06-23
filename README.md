@@ -26,9 +26,6 @@ Google BigQuery (asia-northeast3)
     ├─ article_master            기사 원장
     ├─ cluster_master             클러스터 원장
     └─ cluster_article_events     enter/exit 이벤트 (event_at 기준 일별 파티션)
-    │
-    ▼
-6개 섹션 중 1개 이상 실패 시, 전체 종료 후 정확히 1회 ─→ Gmail SMTP 메일 알림
 ```
 
 ---
@@ -69,7 +66,6 @@ Google BigQuery (asia-northeast3)
 - 6개 섹션을 `matrix`로 병렬 실행 (`fail-fast: false` — 한 섹션 실패가 나머지에 영향 없음)
 - `concurrency.cancel-in-progress: true`로 이전 실행이 끝나기 전 중복 트리거 방지
 - Playwright 브라우저 바이너리는 캐싱되어 매 실행마다 새로 다운로드하지 않는다
-- 6개 섹션이 모두 끝난 뒤, 1개 이상 실패했을 경우에만 별도 `notify` job이 실행되어 이메일 1통 발송
 
 ---
 
@@ -79,9 +75,6 @@ Google BigQuery (asia-northeast3)
 |---|---|
 | `GCP_SA_JSON` | BigQuery 서비스 계정 키 (JSON 전체) |
 | `BQ_PROJECT` | GCP 프로젝트 ID |
-| `MAIL_USERNAME` | 발송용 Gmail 주소 |
-| `MAIL_PASSWORD` | Gmail 앱 비밀번호 |
-| `MAIL_TO` | 알림 수신 이메일 주소 |
 
 서비스 계정에는 다음 IAM 역할이 필요하다.
 - `roles/bigquery.dataEditor` — 테이블 생성/읽기/쓰기

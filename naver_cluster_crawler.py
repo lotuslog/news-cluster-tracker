@@ -196,10 +196,16 @@ def ensure_tables(client: bigquery.Client) -> dict[str, str]:
 # ─────────────────────────────────────────────
 def fetch_active_articles(client: bigquery.Client,
                           events_id: str,
-                          section: str) -> dict[str, dict]:
+                          section: str) -> dict[tuple[str, str], dict]:
     """
     현재 활성 상태(enter가 있고 exit가 없는) 기사를 반환
-    반환: { article_url: { cluster_id, initial_rank } }
+    반환: { (cluster_id, article_url): { initial_rank } }
+
+    [수정] key를 article_url 단독이 아니라 (cluster_id, article_url) 튜플로 변경.
+    같은 기사가 여러 클러스터에 동시에 속하는 경우(실제로 빈번함)가 article_url
+    단독 key에서는 서로 다른 클러스터의 활성 상태를 한 슬롯에서 덮어써서,
+    한 클러스터에서 exit된 게 다른 클러스터의 활성 상태에 가려지거나
+    반대로 같은 exit가 반복 기록되는 문제가 있었음.
 
     섹션 필터링은 cluster_master JOIN으로 처리
     (섹션별 병렬 실행 시 다른 섹션 기사를 건드리지 않기 위해)
@@ -228,8 +234,7 @@ def fetch_active_articles(client: bigquery.Client,
     try:
         rows = client.query(query).result()
         active = {
-            row.article_url: {
-                "cluster_id":   row.cluster_id,
+            (row.cluster_id, row.article_url): {
                 "initial_rank": row.initial_rank,
             }
             for row in rows
@@ -466,24 +471,44 @@ def crawl_cluster(page, cluster_id: str, cluster_url: str,
 # 이벤트 diff 로직
 # ─────────────────────────────────────────────
 def build_events(
-    crawled: list[dict],       # 이번 수집 결과
-    active:  dict[str, dict],  # 현재 활성 기사 { article_url: { cluster_id, ... } }
-    known_articles: set[str],  # article_master 등록 여부
-    known_clusters: set[str],  # cluster_master 등록 여부
-    now: str,                  # TIMESTAMP 문자열
+    crawled: list[dict],                    # 이번 수집 결과
+    active:  dict[tuple[str, str], dict],   # 현재 활성 기사 { (cluster_id, article_url): {...} }
+    known_articles: set[str],               # article_master 등록 여부
+    known_clusters: set[str],               # cluster_master 등록 여부
+    now: str,                               # TIMESTAMP 문자열
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     반환: (new_articles, new_clusters, events)
     - new_articles : article_master에 INSERT할 행
     - new_clusters : cluster_master에 INSERT할 행
     - events       : cluster_article_events에 INSERT할 행 (enter + exit)
+
+    [수정] 동일 article_url이 여러 cluster_id에 동시에 속하는 경우(실제로 1,052건
+    이상 발견되어 흔한 패턴으로 확인됨)를 올바르게 다루기 위해, enter/exit 판단의
+    key를 article_url 단독이 아니라 (cluster_id, article_url) 튜플로 변경했다.
+    기존에는 article_url만 key로 써서 같은 기사가 클러스터 A에서는 활성, 클러스터
+    B에서는 비활성이어도 하나의 슬롯에서 서로 덮어쓰며 충돌했고, 그 결과 같은
+    (cluster_id, article_url) 조합에서 exit가 연속으로 반복 기록되는 버그가 있었다.
     """
-    # 이번 수집에서 본 기사 { article_url: row }
-    crawled_map: dict[str, dict] = {}
+    # 이번 수집에서 본 (cluster_id, article_url) 조합 — enter/exit 판단용
+    # 같은 기사가 여러 클러스터에 동시에 수집되는 경우를 모두 보존한다.
+    crawled_map: dict[tuple[str, str], dict] = {}
     for row in crawled:
         url = row["article_url"]
-        if url and url not in crawled_map:
-            crawled_map[url] = row
+        cid = row["cluster_id"]
+        if not url:
+            continue
+        key = (cid, url)
+        if key not in crawled_map:
+            crawled_map[key] = row
+
+    # article_master 신규 등록 판단은 article_url 단독 기준 그대로 유지
+    # (어느 클러스터에서 봤는지와 무관하게, 기사 자체를 처음 본 시점만 추적)
+    crawled_urls_seen: dict[str, dict] = {}
+    for row in crawled:
+        url = row["article_url"]
+        if url and url not in crawled_urls_seen:
+            crawled_urls_seen[url] = row
 
     new_articles: list[dict] = []
     new_clusters: list[dict] = []
@@ -504,12 +529,8 @@ def build_events(
             })
             known_clusters.add(cid)
 
-    # ── 신규 기사 등록 + enter 이벤트
-    for url, row in crawled_map.items():
-        if not url:
-            continue
-
-        # article_master 신규 등록
+    # ── 신규 기사 등록 (article_url 단독 기준)
+    for url, row in crawled_urls_seen.items():
         if url not in known_articles:
             new_articles.append({
                 "article_url":   url,
@@ -519,21 +540,23 @@ def build_events(
             })
             known_articles.add(url)
 
-        # enter 이벤트: 이전에 활성 상태가 아니었던 기사만
-        if url not in active:
+    # ── enter 이벤트: (cluster_id, article_url) 조합이 이전에 활성이 아니었던 경우만
+    for (cid, url), row in crawled_map.items():
+        if (cid, url) not in active:
             events.append({
-                "cluster_id":   row["cluster_id"],
+                "cluster_id":   cid,
                 "article_url":  url,
                 "event_type":   "enter",
                 "event_at":     now,
                 "initial_rank": row["rank"],
             })
 
-    # ── exit 이벤트: 이전에 활성이었는데 이번 수집에서 사라진 기사
-    for url, meta in active.items():
-        if url not in crawled_map:
+    # ── exit 이벤트: 이전에 활성이었던 (cluster_id, article_url) 조합이
+    #    이번 수집에서 같은 클러스터 안에 더 이상 보이지 않는 경우만
+    for (cid, url), meta in active.items():
+        if (cid, url) not in crawled_map:
             events.append({
-                "cluster_id":   meta["cluster_id"],
+                "cluster_id":   cid,
                 "article_url":  url,
                 "event_type":   "exit",
                 "event_at":     now,

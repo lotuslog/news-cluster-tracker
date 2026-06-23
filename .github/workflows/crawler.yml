@@ -29,24 +29,24 @@ jobs:
       - name: 패키지 설치
         run: pip install -r requirements.txt
 
-      - name: Playwright Chromium 설치
-        run: |
-          playwright install chromium
-          sudo apt-get install -y \
-            libasound2 \
-            libatk-bridge2.0-0 \
-            libatk1.0-0 \
-            libcups2 \
-            libdrm2 \
-            libgbm1 \
-            libgtk-3-0 \
-            libnspr4 \
-            libnss3 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxkbcommon0 \
-            libxrandr2
+      - name: Playwright 버전 확인 (캐시 키용)
+        id: pw-version
+        run: echo "version=$(pip show playwright | grep Version | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+
+      - name: Playwright 브라우저 캐시 복원
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+
+      - name: Playwright Chromium 설치 (캐시 미스 시에만)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Playwright 시스템 의존성만 설치 (캐시 히트 시)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
 
       - name: 크롤러 실행
         env:

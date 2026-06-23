@@ -407,7 +407,8 @@ def crawl_cluster(page, cluster_id: str, cluster_url: str,
         article_items = soup.select("li:has(a[href*='n.news.naver.com'])")
 
     log.info(f"  기사 {len(article_items)}건 ({cluster_title[:20] if cluster_title else cluster_id})")
-    
+
+    parsed_articles = []
     for rank, item in enumerate(article_items, start=1):
         press_el = item.select_one("div.sa_text_press")
         press = press_el.get_text(strip=True) if press_el else ""
@@ -426,15 +427,36 @@ def crawl_cluster(page, cluster_id: str, cluster_url: str,
         article_title = title_el.get_text(strip=True) if title_el \
                         else link_el.get_text(strip=True)
 
+        parsed_articles.append({
+            "rank":          rank,
+            "article_url":   article_url,
+            "article_title": article_title,
+            "press":         press,
+        })
+
+    # [수정] cluster_title이 비어있거나(예: 정치 섹션 일부) "관련 뉴스"처럼 의미 없는
+    # 플레이스홀더인 경우, 첫 진입(rank=1) 기사의 article_title로 대체한다.
+    PLACEHOLDER_TITLES = {"관련 뉴스", "관련뉴스"}
+    if (not cluster_title or cluster_title.strip() in PLACEHOLDER_TITLES) and parsed_articles:
+        original_title = cluster_title
+        first_article = next((a for a in parsed_articles if a["rank"] == 1), None)
+        if first_article:
+            cluster_title = first_article["article_title"]
+            log.info(
+                f"  cluster_title('{original_title}')이 비어있거나 플레이스홀더라 "
+                f"rank=1 기사 제목으로 대체: {cluster_title[:30]}"
+            )
+
+    for a in parsed_articles:
         rows.append({
             "cluster_id":         cluster_id,
             "cluster_title":      cluster_title,
             "cluster_created_at": cluster_created_at,
             "section":            section_name,
-            "article_url":        article_url,
-            "article_title":      article_title,
-            "press":              press,
-            "rank":               rank,
+            "article_url":        a["article_url"],
+            "article_title":      a["article_title"],
+            "press":              a["press"],
+            "rank":               a["rank"],
         })
 
     return rows

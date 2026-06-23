@@ -49,6 +49,7 @@ HEADLESS              = True
 PAGE_TIMEOUT          = 20_000
 CLICK_DELAY           = 1.0
 BETWEEN_CLUSTER_DELAY = 1.2
+MAX_MORE_CLICKS       = 15  # "기사 더보기" 최대 반복 클릭 횟수 (대형 클러스터 전체 로드 보장용 안전 상한)
 
 # ─────────────────────────────────────────────
 # [추가] URL 정형화 유틸 
@@ -375,13 +376,28 @@ def crawl_cluster(page, cluster_id: str, cluster_url: str,
         log.warning(f"  타임아웃: {cluster_id}")
         return rows
 
-    try:
-        more_btn = page.locator("a:has-text('기사 더보기'), button:has-text('기사 더보기')")
-        if more_btn.count() > 0:
+    # [수정] "기사 더보기"를 1회만 클릭하면, 기사가 많은 대형 클러스터(예: 90건 이상)는
+    # 한 번의 클릭으로 전체 목록이 다 로드되지 않는다. 그 결과 수집 사이클마다 로드되는
+    # 기사 수가 들쑥날쑥해져서, 실제로는 빠지지 않은 기사들이 한꺼번에 exit 처리되고
+    # 다음 사이클에 다시 enter로 잡히는 "깜빡임" 버그가 발생했다 (한 클러스터에서
+    # 96~100개 기사가 동시에 enter/exit하는 패턴으로 확인됨).
+    # → 버튼이 더 이상 보이지 않을 때까지(최대 MAX_MORE_CLICKS회) 반복 클릭한다.
+    more_click_count = 0
+    more_click_failed = False
+    for _ in range(MAX_MORE_CLICKS):
+        try:
+            more_btn = page.locator("a:has-text('기사 더보기'), button:has-text('기사 더보기')")
+            if more_btn.count() == 0:
+                break
             more_btn.first.click()
+            more_click_count += 1
             time.sleep(CLICK_DELAY)
-    except Exception:
-        pass
+        except Exception as e:
+            log.warning(f"  [{cluster_id}] 더보기 클릭 실패 ({more_click_count}번째 시도): {e}")
+            more_click_failed = True
+            break
+    if more_click_count > 0:
+        log.info(f"  [{cluster_id}] 더보기 {more_click_count}회 클릭")
 
     soup = BeautifulSoup(page.content(), "html.parser")
 
@@ -462,6 +478,9 @@ def crawl_cluster(page, cluster_id: str, cluster_url: str,
             "article_title":      a["article_title"],
             "press":              a["press"],
             "rank":               a["rank"],
+            "more_click_failed":  more_click_failed,  # [추가] 이 클러스터의 더보기 클릭이
+                                                        # 중간에 실패했는지 — 신뢰도 낮은 부분
+                                                        # 수집 결과를 build_events에서 걸러내기 위함
         })
 
     return rows
@@ -489,18 +508,35 @@ def build_events(
     기존에는 article_url만 key로 써서 같은 기사가 클러스터 A에서는 활성, 클러스터
     B에서는 비활성이어도 하나의 슬롯에서 서로 덮어쓰며 충돌했고, 그 결과 같은
     (cluster_id, article_url) 조합에서 exit가 연속으로 반복 기록되는 버그가 있었다.
+
+    [추가] "기사 더보기" 클릭이 중간에 실패한 클러스터는, 이번 수집 결과가 실제
+    전체 목록을 반영하지 못했을 가능성이 높다 (대형 클러스터일수록 더보기를 여러 번
+    눌러야 전체가 로드됨). 이런 클러스터에서는 "이번에 안 보였다"는 사실을 신뢰할 수
+    없으므로, 해당 클러스터에 대한 exit 판단을 건너뛴다. enter 판단은 "실제로 보인
+    기사"에 대한 것이라 영향이 없어 그대로 유지한다.
     """
     # 이번 수집에서 본 (cluster_id, article_url) 조합 — enter/exit 판단용
     # 같은 기사가 여러 클러스터에 동시에 수집되는 경우를 모두 보존한다.
     crawled_map: dict[tuple[str, str], dict] = {}
+    # 더보기 클릭이 실패해서 전체 목록을 못 가져왔을 가능성이 있는 cluster_id 집합
+    unreliable_clusters: set[str] = set()
     for row in crawled:
         url = row["article_url"]
         cid = row["cluster_id"]
+        if row.get("more_click_failed"):
+            unreliable_clusters.add(cid)
         if not url:
             continue
         key = (cid, url)
         if key not in crawled_map:
             crawled_map[key] = row
+
+    if unreliable_clusters:
+        log.warning(
+            f"더보기 클릭 실패로 exit 판단을 건너뛰는 클러스터 "
+            f"{len(unreliable_clusters)}개: {list(unreliable_clusters)[:5]}"
+            f"{' ...' if len(unreliable_clusters) > 5 else ''}"
+        )
 
     # article_master 신규 등록 판단은 article_url 단독 기준 그대로 유지
     # (어느 클러스터에서 봤는지와 무관하게, 기사 자체를 처음 본 시점만 추적)
@@ -553,7 +589,13 @@ def build_events(
 
     # ── exit 이벤트: 이전에 활성이었던 (cluster_id, article_url) 조합이
     #    이번 수집에서 같은 클러스터 안에 더 이상 보이지 않는 경우만
+    #    단, 더보기 클릭이 실패해 전체 목록을 못 가져왔을 가능성이 있는
+    #    클러스터(unreliable_clusters)는 exit 판단에서 제외한다.
+    skipped_exit_cnt = 0
     for (cid, url), meta in active.items():
+        if cid in unreliable_clusters:
+            skipped_exit_cnt += 1
+            continue
         if (cid, url) not in crawled_map:
             events.append({
                 "cluster_id":   cid,
@@ -566,6 +608,8 @@ def build_events(
     enter_cnt = sum(1 for e in events if e["event_type"] == "enter")
     exit_cnt  = sum(1 for e in events if e["event_type"] == "exit")
     log.info(f"이벤트 — enter: {enter_cnt} / exit: {exit_cnt}")
+    if skipped_exit_cnt:
+        log.info(f"더보기 실패로 exit 판단 보류: {skipped_exit_cnt}건")
     log.info(f"신규 — article_master: {len(new_articles)} / cluster_master: {len(new_clusters)}")
 
     return new_articles, new_clusters, events

@@ -97,7 +97,7 @@ class ArticleMasterRow:
     article_url:   str
     article_title: str
     press:         str
-    first_seen_at: str  # TIMESTAMP
+    first_seen_at: str  # DATETIME (KST 그대로 저장)
 
 @dataclass
 class ClusterMasterRow:
@@ -105,40 +105,44 @@ class ClusterMasterRow:
     cluster_title:      str
     section:            str
     cluster_created_at: str
-    first_seen_at:      str  # TIMESTAMP
+    first_seen_at:      str  # DATETIME (KST 그대로 저장)
 
 @dataclass
 class ClusterArticleEvent:
     cluster_id:   str
     article_url:  str
     event_type:   str        # "enter" | "exit"
-    event_at:     str        # TIMESTAMP
+    event_at:     str        # DATETIME (KST 그대로 저장)
     initial_rank: int | None # enter 시에만, exit는 None
 
 
 # ─────────────────────────────────────────────
 # BigQuery 스키마
+# [수정] TIMESTAMP → DATETIME으로 변경. TIMESTAMP는 절대 시점(UTC 기준)을
+# 저장하는 타입이라 타임존 없는 문자열을 넣으면 UTC로 오인되는 문제가 있었다.
+# DATETIME은 타임존 정보가 없는 "벽시계 시각"을 그대로 저장하므로, KST로
+# 계산한 문자열을 그대로 넣으면 조회 시에도 변환 없이 KST 그대로 보인다.
 # ─────────────────────────────────────────────
 SCHEMA_ARTICLE_MASTER = [
-    bigquery.SchemaField("article_url",   "STRING",    mode="REQUIRED"),
+    bigquery.SchemaField("article_url",   "STRING",   mode="REQUIRED"),
     bigquery.SchemaField("article_title", "STRING"),
     bigquery.SchemaField("press",         "STRING"),
-    bigquery.SchemaField("first_seen_at", "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("first_seen_at", "DATETIME", mode="REQUIRED"),
 ]
 
 SCHEMA_CLUSTER_MASTER = [
-    bigquery.SchemaField("cluster_id",         "STRING",    mode="REQUIRED"),
+    bigquery.SchemaField("cluster_id",         "STRING",   mode="REQUIRED"),
     bigquery.SchemaField("cluster_title",      "STRING"),
     bigquery.SchemaField("section",            "STRING"),
     bigquery.SchemaField("cluster_created_at", "STRING"),
-    bigquery.SchemaField("first_seen_at",      "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("first_seen_at",      "DATETIME", mode="REQUIRED"),
 ]
 
 SCHEMA_CLUSTER_ARTICLE_EVENTS = [
-    bigquery.SchemaField("cluster_id",   "STRING",    mode="REQUIRED"),
-    bigquery.SchemaField("article_url",  "STRING",    mode="REQUIRED"),
-    bigquery.SchemaField("event_type",   "STRING",    mode="REQUIRED"),
-    bigquery.SchemaField("event_at",     "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("cluster_id",   "STRING",   mode="REQUIRED"),
+    bigquery.SchemaField("article_url",  "STRING",   mode="REQUIRED"),
+    bigquery.SchemaField("event_type",   "STRING",   mode="REQUIRED"),
+    bigquery.SchemaField("event_at",     "DATETIME", mode="REQUIRED"),
     bigquery.SchemaField("initial_rank", "INTEGER"),  # NULLABLE
 ]
 
@@ -228,7 +232,7 @@ def fetch_active_articles(client: bigquery.Client,
             JOIN `{BQ_PROJECT}.{BQ_DATASET}.{TBL_CLUSTER}` c
               ON e.cluster_id = c.cluster_id
             WHERE c.section = '{section}'
-              AND e.event_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+              AND e.event_at >= DATETIME_SUB(CURRENT_DATETIME('Asia/Seoul'), INTERVAL 30 DAY)
         )
         SELECT cluster_id, article_url, initial_rank
         FROM last_event
@@ -508,7 +512,7 @@ def build_events(
     active:  dict[tuple[str, str], dict],   # 현재 활성 기사 { (cluster_id, article_url): {...} }
     known_articles: set[str],               # article_master 등록 여부
     known_clusters: set[str],               # cluster_master 등록 여부
-    now: str,                               # TIMESTAMP 문자열
+    now: str,                               # DATETIME 문자열 (KST)
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     반환: (new_articles, new_clusters, events)
@@ -637,15 +641,12 @@ def main():
     KST = pytz.timezone("Asia/Seoul")
     start = datetime.now(KST)
 
-    # [수정] 기존에는 KST 기준 시각을 타임존 정보 없는 문자열
-    # ("%Y-%m-%d %H:%M:%S")로 만들어 BigQuery TIMESTAMP 컬럼에 넣었다.
-    # BigQuery는 타임존 정보가 없는 문자열을 받으면 UTC로 간주해 저장하므로,
-    # 실제로는 KST 시각인데 그 값이 그대로 UTC로 찍혀 9시간이 어긋나는
-    # 문제가 있었다 (예: 실제 한국시간 09:00이 "09:00 UTC"로 저장되어
-    # 조회 시 실제로는 한국시간 18:00을 가리키게 됨).
-    # → UTC로 명시적으로 변환한 ISO 8601 문자열(타임존 오프셋 포함)을 사용해
-    # BigQuery가 절대 헷갈리지 않도록 한다.
-    now_str = start.astimezone(pytz.utc).isoformat()
+    # [수정] 컬럼 타입을 TIMESTAMP에서 DATETIME으로 변경함에 따라, 저장 문자열도
+    # KST 기준 타임존 정보 없는 문자열로 되돌린다. DATETIME은 TIMESTAMP와 달리
+    # "절대 시점"이 아니라 "타임존 없는 시각"을 그대로 저장하는 타입이라, BigQuery가
+    # 이 값을 UTC로 재해석하지 않는다. 즉 여기 적힌 숫자 그대로가 KST이고,
+    # 조회 시 별도 변환이 필요 없다.
+    now_str = start.strftime("%Y-%m-%d %H:%M:%S")
 
     if TARGET_SECTION:
         name, sid = TARGET_SECTION.split(",")
@@ -654,7 +655,7 @@ def main():
         sections = SECTIONS
 
     log.info("=" * 60)
-    log.info(f"크롤러 시작: {start.strftime('%Y-%m-%d %H:%M:%S')} KST (저장값 UTC: {now_str})")
+    log.info(f"크롤러 시작: {now_str} KST (DATETIME 컬럼에 그대로 저장)")
     log.info(f"실행 섹션: {list(sections.keys())}")
     log.info("=" * 60)
 

@@ -1,7 +1,7 @@
 """
 네이버 뉴스 클러스터 크롤러 — 이벤트 기반 버전
 - 테이블: article_master / cluster_master / cluster_article_events
-- 적재 방식: 진입(enter) / 이탈(exit) 이벤트만 append (스냅샷 방식 폐기)
+- 적재 방식: 진입(enter) / 이탈(exit) 이벤트만 append
 - 중복 방지: 현재 활성 기사 목록을 BQ에서 조회 후 diff
 - 로그: stdout (Actions 콘솔에서 바로 확인)
 """
@@ -622,7 +622,8 @@ def main():
     import pytz
     KST = pytz.timezone("Asia/Seoul")
     start = datetime.now(KST)
-    now_str = start.strftime("%Y-%m-%d %H:%M:%S")
+    
+    now_str = start.astimezone(pytz.utc).isoformat()
 
     if TARGET_SECTION:
         name, sid = TARGET_SECTION.split(",")
@@ -631,7 +632,7 @@ def main():
         sections = SECTIONS
 
     log.info("=" * 60)
-    log.info(f"크롤러 시작: {now_str} KST")
+    log.info(f"크롤러 시작: {start.strftime('%Y-%m-%d %H:%M:%S')} KST (저장값 UTC: {now_str})")
     log.info(f"실행 섹션: {list(sections.keys())}")
     log.info("=" * 60)
 
@@ -643,7 +644,6 @@ def main():
     cluster_id = table_ids[TBL_CLUSTER]
     events_id  = table_ids[TBL_EVENTS]
 
-    # [변경] 기존의 테이블 전체 로드(Full Scan) 방식을 폐기하고 섹션별 루프 내에서 처리하도록 변경합니다.
     total_enter = total_exit = 0
     had_error = False  # [추가] 섹션 처리 중 예외가 한 번이라도 발생했는지 추적
 

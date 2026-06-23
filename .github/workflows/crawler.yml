@@ -55,25 +55,3 @@ jobs:
           BQ_DATASET:     naver_cluster
           TARGET_SECTION: ${{ matrix.section }}
         run: python naver_cluster_crawler.py
-
-  notify:
-    needs: crawl
-    if: failure()
-    runs-on: ubuntu-22.04
-    steps:
-      - name: 실패 메일 발송
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "⚠️ 클러스터 크롤러 실패 - ${{ github.run_id }}"
-          to: ${{ secrets.MAIL_TO }}
-          from: 클러스터 크롤러 알림
-          body: |
-            6개 섹션 중 1개 이상이 실패했습니다.
-
-            저장소: ${{ github.repository }}
-            실행 ID: ${{ github.run_id }}
-            실행 로그: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -1,0 +1,30 @@
+name: last_seen_at 동기화
+
+on:
+  workflow_dispatch:  # cron-job.org에서 매시 5분에 호출
+ 
+concurrency:
+  group: sync-last-seen-job
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Google Cloud 인증
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_JSON }}
+
+      - name: gcloud / bq CLI 설정
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: last_seen_at 동기화 쿼리 실행
+        run: |
+          bq query --use_legacy_sql=false \
+            --project_id=${{ secrets.BQ_PROJECT }} \
+            < sync_last_seen_at.sql

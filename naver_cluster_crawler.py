@@ -1,21 +1,19 @@
 """
-네이버 뉴스 클러스터 크롤러 — sighting_log 기반 버전
-- 테이블: article_master / cluster_master / article_cluster_link / sighting_log
-- 적재 방식:
-  - article_cluster_link: 신규 (cluster_id, article_url) 조합만 1회 INSERT
-    (initial_rank, first_seen_at — 영구 불변)
-  - sighting_log: 매 수집마다 이번에 본 모든 조합을 무조건 append
-    (cluster_id, article_url, seen_at — "마지막으로 본 시점"은 조회 시
-    이 테이블의 MAX(seen_at)으로 동적 계산. v_link_with_last_seen 뷰 참고)
-- [변경 이유 1] 네이버 클러스터 노출이 사용자/세션/새로고침마다 달라질 수 있어,
+네이버 뉴스 클러스터 크롤러 — 최종 버전 (결제 계정 연결 전제)
+- 테이블: article_master / cluster_master / article_cluster_link
+- 적재 방식: (cluster_id, article_url) 조합을 MERGE로 UPSERT
+  - 신규 조합이면 first_seen_at = last_seen_at = 지금, INSERT
+  - 이미 있는 조합이면 last_seen_at만 지금으로 UPDATE
+- [설계 배경] 네이버 클러스터 노출이 사용자/세션/새로고침마다 달라질 수 있어,
   "이번에 안 보였다 = 클러스터에서 빠졌다"는 가정(enter/exit 이벤트 모델)이
   실제 도메인과 맞지 않았다. exit 추적을 폐기하고 "마지막으로 본 시점"만
-  갱신하는 방식으로 전환했다.
-- [변경 이유 2] "마지막으로 본 시점"을 UPDATE/MERGE(DML)로 직접 갱신하려
-  했으나, 결제 계정이 연결되지 않은 프로젝트에서는 DML이 막혀(403
-  billingNotEnabled) 매번 조용히 실패했다. DML 없이도 동작하도록, 갱신을
-  append(Load Job)로 바꾸고 조회 시점에 최신값을 계산하는 구조로 변경했다.
+  갱신하는 구조로 전환했다.
+- [전제] 이 버전은 결제 계정이 연결된 GCP 프로젝트에서 동작한다. MERGE(DML)를
+  직접 사용하므로, 결제 계정이 없는 프로젝트(BigQuery 무료 등급)에서는
+  "DML queries are not allowed in the free tier" 에러로 실패한다.
 - 시간 컬럼은 DATETIME(KST, 타임존 정보 없는 문자열)으로 저장한다.
+- "기사 더보기"는 버튼이 더 이상 보이지 않을 때까지 반복 클릭해, 대형
+  클러스터의 전체 기사 목록을 누락 없이 가져온다.
 - 로그: stdout (Actions 콘솔에서 바로 확인)
 """
 
@@ -54,16 +52,15 @@ BQ_DATASET     = os.environ.get("BQ_DATASET", "naver_cluster")
 TARGET_SECTION = os.environ.get("TARGET_SECTION")  # 예: "정치,100"
 
 # 테이블명
-TBL_ARTICLE  = "article_master"
-TBL_CLUSTER  = "cluster_master"
-TBL_LINK     = "article_cluster_link"  # 신규 조합만 1회 INSERT (영구)
-TBL_SIGHTING = "sighting_log"          # 매 수집마다 append (last_seen 추적용)
+TBL_ARTICLE = "article_master"
+TBL_CLUSTER = "cluster_master"
+TBL_LINK    = "article_cluster_link"
 
 HEADLESS              = True
 PAGE_TIMEOUT          = 20_000
 CLICK_DELAY           = 1.0
 BETWEEN_CLUSTER_DELAY = 1.2
-MAX_MORE_CLICKS       = 15     # "기사 더보기" 최대 반복 클릭 횟수 (대형 클러스터 전체 로드 보장용 안전 상한)
+MAX_MORE_CLICKS        = 15     # "기사 더보기" 최대 반복 클릭 횟수 (대형 클러스터 전체 로드 보장용 안전 상한)
 MORE_BTN_CLICK_TIMEOUT = 3_000  # 더보기 버튼 클릭 전용 타임아웃(ms) — PAGE_TIMEOUT(20초)보다 훨씬 짧게
                                 # 줘서, 버튼이 안 보이는 경우(더 보여줄 기사가 없음) 빠르게 다음으로 넘어간다
 
@@ -123,39 +120,22 @@ class ClusterMasterRow:
 
 @dataclass
 class ArticleClusterLink:
-    """(cluster_id, article_url) 신규 조합만 1회 INSERT, 영구 불변.
+    """(cluster_id, article_url)를 MERGE로 UPSERT.
     PK: (cluster_id, article_url)
     """
     cluster_id:    str
     article_url:   str
     initial_rank:  int | None  # 최초 진입 시 순위, 한 번 설정 후 변경 안 됨
     first_seen_at: str         # DATETIME (KST) — 최초로 본 시점, 불변
-
-@dataclass
-class SightingLogRow:
-    """[추가] 매 수집마다 이번에 본 (cluster_id, article_url) 조합을 무조건
-    append. "마지막으로 본 시점"은 이 테이블의 MAX(seen_at)으로 조회 시점에
-    동적 계산한다 (v_link_with_last_seen 뷰 참고). DML(UPDATE/MERGE) 없이
-    last_seen을 추적하기 위한 구조 — 결제 계정이 연결되지 않은 프로젝트에서
-    DML이 막히는 제약을 append-only로 우회한다.
-    """
-    cluster_id:  str
-    article_url: str
-    seen_at:     str  # DATETIME (KST)
+    last_seen_at:  str         # DATETIME (KST) — 가장 최근에 본 시점, 매번 갱신
 
 
 # ─────────────────────────────────────────────
 # BigQuery 스키마
-# [수정] TIMESTAMP → DATETIME으로 변경. TIMESTAMP는 절대 시점(UTC 기준)을
-# 저장하는 타입이라 타임존 없는 문자열을 넣으면 UTC로 오인되는 문제가 있었다.
-# DATETIME은 타임존 정보가 없는 "벽시계 시각"을 그대로 저장하므로, KST로
-# 계산한 문자열을 그대로 넣으면 조회 시에도 변환 없이 KST 그대로 보인다.
-#
-# [수정] article_cluster_link에서 last_seen_at 컬럼 제거. MERGE(DML)로
-# last_seen_at을 직접 갱신하려 했으나 결제 계정 미연결 프로젝트에서 DML이
-# 막혀(403 billingNotEnabled) 매번 조용히 실패하는 문제가 있었다.
-# sighting_log(append-only)를 신설해 그쪽에 "본 시점"을 매번 기록하고,
-# 조회 시 뷰에서 MAX(seen_at)으로 last_seen_at을 동적 계산하도록 했다.
+# TIMESTAMP 대신 DATETIME 사용. TIMESTAMP는 절대 시점(UTC 기준)을 저장하는
+# 타입이라 타임존 없는 문자열을 넣으면 UTC로 오인되는 문제가 있다. DATETIME은
+# 타임존 정보가 없는 "벽시계 시각"을 그대로 저장하므로, KST로 계산한 문자열을
+# 그대로 넣으면 조회 시에도 변환 없이 KST 그대로 보인다.
 # ─────────────────────────────────────────────
 SCHEMA_ARTICLE_MASTER = [
     bigquery.SchemaField("article_url",   "STRING",   mode="REQUIRED"),
@@ -177,12 +157,7 @@ SCHEMA_ARTICLE_CLUSTER_LINK = [
     bigquery.SchemaField("article_url",   "STRING",   mode="REQUIRED"),
     bigquery.SchemaField("initial_rank",  "INTEGER"),  # NULLABLE
     bigquery.SchemaField("first_seen_at", "DATETIME", mode="REQUIRED"),
-]
-
-SCHEMA_SIGHTING_LOG = [
-    bigquery.SchemaField("cluster_id",  "STRING",   mode="REQUIRED"),
-    bigquery.SchemaField("article_url", "STRING",   mode="REQUIRED"),
-    bigquery.SchemaField("seen_at",     "DATETIME", mode="REQUIRED"),
+    bigquery.SchemaField("last_seen_at",  "DATETIME", mode="REQUIRED"),
 ]
 
 
@@ -213,19 +188,13 @@ def ensure_tables(client: bigquery.Client) -> dict[str, str]:
         log.info(f"데이터셋 생성: {BQ_DATASET}")
 
     table_configs = [
-        (TBL_ARTICLE,  SCHEMA_ARTICLE_MASTER,        None,          None),
-        (TBL_CLUSTER,  SCHEMA_CLUSTER_MASTER,        None,          None),
-        (TBL_LINK,     SCHEMA_ARTICLE_CLUSTER_LINK,  "first_seen_at", None),
-        # [추가] sighting_log는 seen_at 기준 일별 파티션 + 파티션 만료 1일.
-        # "마지막으로 본 시점" 추적만 목적이라 오래된 행을 영구 보존할 필요가
-        # 없다 — article_cluster_link의 first_seen_at에 이미 "최초 발견"은
-        # 영구 기록되어 있으므로, sighting_log는 최근 시점 판단용 단기 데이터로만
-        # 운용하고 자동 만료시켜 용량을 관리한다.
-        (TBL_SIGHTING, SCHEMA_SIGHTING_LOG,          "seen_at",     1),
+        (TBL_ARTICLE, SCHEMA_ARTICLE_MASTER,       None),
+        (TBL_CLUSTER, SCHEMA_CLUSTER_MASTER,       None),
+        (TBL_LINK,    SCHEMA_ARTICLE_CLUSTER_LINK, "first_seen_at"),  # 파티션
     ]
 
     table_ids = {}
-    for tbl_name, schema, partition_field, expiration_days in table_configs:
+    for tbl_name, schema, partition_field in table_configs:
         full_id = f"{BQ_PROJECT}.{BQ_DATASET}.{tbl_name}"
         try:
             client.get_table(full_id)
@@ -235,16 +204,9 @@ def ensure_tables(client: bigquery.Client) -> dict[str, str]:
                 tbl.time_partitioning = bigquery.TimePartitioning(
                     type_=bigquery.TimePartitioningType.DAY,
                     field=partition_field,
-                    expiration_ms=(
-                        expiration_days * 24 * 60 * 60 * 1000
-                        if expiration_days else None
-                    ),  # [추가] N일 지난 파티션은 BigQuery가 자동으로 삭제
                 )
             client.create_table(tbl, exists_ok=True)
-            log.info(
-                f"테이블 생성: {full_id}"
-                + (f" (파티션 {expiration_days}일 후 자동 만료)" if expiration_days else "")
-            )
+            log.info(f"테이블 생성: {full_id}")
         table_ids[tbl_name] = full_id
 
     return table_ids
@@ -256,7 +218,7 @@ def ensure_tables(client: bigquery.Client) -> dict[str, str]:
 # 상태"라는 개념 자체가 없어졌다 — 네이버 클러스터 노출이 사용자/세션마다
 # 달라 "지금 활성인지"를 신뢰할 수 없었기 때문. 대신 이번에 수집된 조합이
 # article_cluster_link에 이미 있는지만 확인하면 충분하다 (있으면 신규 INSERT를
-# 스킵하고 sighting_log에만 append, 없으면 link에도 신규 INSERT).
+# 신규 INSERT 여부 판단용 (있으면 last_seen_at만 UPDATE, 없으면 신규 INSERT)
 # ─────────────────────────────────────────────
 def fetch_existing_links(client: bigquery.Client,
                          link_id: str,
@@ -349,17 +311,41 @@ def bq_insert(client: bigquery.Client, table_id: str,
     if job.errors:
         log.error(f"BigQuery insert 에러 ({table_id}): {job.errors}")
         return 0
-    log.info(f"INSERT {len(rows)}행 → {table_id.split('.')[-1]}")
-    return len(rows)
+def bq_update_last_seen(client: bigquery.Client, link_id: str,
+                        updates: list[tuple[str, str, str]]) -> int:
+    """
+    이미 article_cluster_link에 존재하는 (cluster_id, article_url) 조합의
+    last_seen_at만 갱신한다. updates: [(cluster_id, article_url, now_str), ...]
 
+    DML(MERGE)을 사용한다 — 이 버전은 결제 계정이 연결된 프로젝트를 전제로
+    하므로 무료 등급 DML 제한에 해당하지 않는다. 조합 수가 많을 때를 대비해
+    하나의 MERGE 문으로 일괄 처리한다(쿼리 1회로 N건 갱신, 비용 효율적).
+    """
+    if not updates:
+        return 0
 
-# [삭제] bq_update_last_seen() — MERGE(DML)로 last_seen_at을 직접 갱신하려
-# 했으나, 결제 계정이 연결되지 않은 프로젝트에서 DML이 막혀(403
-# billingNotEnabled) 매번 조용히 실패했다. 이제 last_seen 추적은
-# sighting_log(append-only, bq_insert 재사용)로 대체되어 별도 함수가
-# 필요 없다 — 신규/기존 조합 모두 sighting_log에 동일하게 append하면 되고,
-# "마지막으로 본 시점"은 조회 시 v_link_with_last_seen 뷰에서 MAX(seen_at)으로
-# 계산한다.
+    values_str = ", ".join(
+        f"STRUCT('{cid}' AS cluster_id, '{url}' AS article_url, DATETIME('{now}') AS new_last_seen_at)"
+        for cid, url, now in updates
+    )
+    query = f"""
+        MERGE `{link_id}` AS target
+        USING (
+            SELECT * FROM UNNEST([{values_str}])
+        ) AS source
+        ON target.cluster_id = source.cluster_id
+           AND target.article_url = source.article_url
+        WHEN MATCHED THEN
+            UPDATE SET last_seen_at = source.new_last_seen_at
+    """
+    try:
+        job = client.query(query)
+        job.result()
+        log.info(f"UPDATE {len(updates)}행 → {link_id.split('.')[-1]} (last_seen_at 갱신)")
+        return len(updates)
+    except Exception as e:
+        log.error(f"last_seen_at 갱신 실패: {e}")
+        return 0
 
 
 # ─────────────────────────────────────────────
@@ -563,24 +549,21 @@ def build_link_updates(
     known_articles: set[str],                          # article_master 등록 여부
     known_clusters: set[str],                          # cluster_master 등록 여부
     now: str,                                          # DATETIME 문자열 (KST)
-) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict], list[tuple[str, str, str]]]:
     """
-    [변경] build_events() → build_link_updates()로 교체.
-    enter/exit 이벤트를 만들지 않고, 다음 두 가지 대상만 만든다.
-    - article_cluster_link: 신규 (cluster_id, article_url) 조합만 INSERT
-      (이미 있는 조합은 손대지 않음 — first_seen_at은 불변이라 다시 쓸 필요 없음)
-    - sighting_log: 이번에 본 모든 조합을 무조건 append (신규/기존 구분 없이)
-      → "마지막으로 본 시점"은 여기 쌓인 행의 MAX(seen_at)으로 조회 시 계산
+    enter/exit 이벤트를 만들지 않고, article_cluster_link에 대한
+    INSERT(신규 조합) / UPDATE(기존 조합의 last_seen_at 갱신) 대상만 만든다.
 
-    반환: (new_articles, new_clusters, new_links, sighting_rows)
-    - new_articles  : article_master에 INSERT할 행
-    - new_clusters  : cluster_master에 INSERT할 행
-    - new_links     : article_cluster_link에 INSERT할 신규 조합
-    - sighting_rows : sighting_log에 append할 행 (이번 수집 전체)
+    반환: (new_articles, new_clusters, new_links, last_seen_updates)
+    - new_articles      : article_master에 INSERT할 행
+    - new_clusters      : cluster_master에 INSERT할 행
+    - new_links         : article_cluster_link에 INSERT할 신규 조합
+    - last_seen_updates : article_cluster_link에서 last_seen_at만 갱신할
+                          (cluster_id, article_url, now) 튜플 목록
 
-    "더보기 클릭 실패 시 exit 보류" 로직은 더 이상 필요 없다 — exit 판단
-    자체가 없어졌기 때문이다 (네이버 클러스터 노출이 사용자/세션마다 달라
-    "안 보였다 = 사라졌다"를 신뢰할 수 없어, exit 추적을 폐기했다).
+    "더보기 클릭 실패 시 exit 보류" 로직은 필요 없다 — exit 판단 자체가
+    없기 때문이다 (네이버 클러스터 노출이 사용자/세션마다 달라 "안 보였다 =
+    사라졌다"를 신뢰할 수 없어, exit 추적을 처음부터 두지 않는다).
     """
     # 이번 수집에서 본 (cluster_id, article_url) 조합 — 같은 기사가 여러
     # 클러스터에 동시에 수집되는 경우를 모두 보존한다.
@@ -602,10 +585,10 @@ def build_link_updates(
         if url and url not in crawled_urls_seen:
             crawled_urls_seen[url] = row
 
-    new_articles:  list[dict] = []
-    new_clusters:  list[dict] = []
-    new_links:     list[dict] = []
-    sighting_rows: list[dict] = []
+    new_articles: list[dict] = []
+    new_clusters: list[dict] = []
+    new_links:    list[dict] = []
+    last_seen_updates: list[tuple[str, str, str]] = []
 
     # ── 신규 클러스터 등록
     seen_cluster_ids = {row["cluster_id"] for row in crawled}
@@ -632,28 +615,25 @@ def build_link_updates(
             })
             known_articles.add(url)
 
-    # ── article_cluster_link: 신규 조합만 INSERT (기존 조합은 그대로 둠)
-    # ── sighting_log: 신규/기존 구분 없이 이번에 본 모든 조합을 append
+    # ── article_cluster_link: 신규 조합은 INSERT, 기존 조합은 last_seen_at만 UPDATE
     for (cid, url), row in crawled_map.items():
-        sighting_rows.append({
-            "cluster_id":  cid,
-            "article_url": url,
-            "seen_at":     now,
-        })
-        if (cid, url) not in existing_links:
+        if (cid, url) in existing_links:
+            last_seen_updates.append((cid, url, now))
+        else:
             new_links.append({
                 "cluster_id":    cid,
                 "article_url":   url,
                 "initial_rank":  row["rank"],
                 "first_seen_at": now,
+                "last_seen_at":  now,
             })
 
     log.info(
-        f"링크 — 신규: {len(new_links)} / sighting_log append: {len(sighting_rows)}"
+        f"링크 — 신규: {len(new_links)} / last_seen_at 갱신: {len(last_seen_updates)}"
     )
     log.info(f"신규 — article_master: {len(new_articles)} / cluster_master: {len(new_clusters)}")
 
-    return new_articles, new_clusters, new_links, sighting_rows
+    return new_articles, new_clusters, new_links, last_seen_updates
 
 
 # ─────────────────────────────────────────────
@@ -686,13 +666,12 @@ def main():
     client    = get_bq_client()
     table_ids = ensure_tables(client)
 
-    article_id  = table_ids[TBL_ARTICLE]
-    cluster_id  = table_ids[TBL_CLUSTER]
-    link_id     = table_ids[TBL_LINK]
-    sighting_id = table_ids[TBL_SIGHTING]
+    article_id = table_ids[TBL_ARTICLE]
+    cluster_id = table_ids[TBL_CLUSTER]
+    link_id    = table_ids[TBL_LINK]
 
     # [변경] 기존의 테이블 전체 로드(Full Scan) 방식을 폐기하고 섹션별 루프 내에서 처리하도록 변경합니다.
-    total_new_links = total_sightings = 0
+    total_new_links = total_updated_links = 0
     had_error = False  # [추가] 섹션 처리 중 예외가 한 번이라도 발생했는지 추적
 
     with sync_playwright() as pw:
@@ -718,9 +697,7 @@ def main():
                 log.info(f"[{section_name}] 수집: {len(crawled)}건")
 
                 # [안전장치] 수집된 데이터가 아예 없으면 네트워크 오류 또는 구조 변경일
-                # 수 있으므로 이 섹션은 스킵합니다. (이제 exit 판단이 없어 "활성 기사가
-                # 통째로 exit 처리되는" 위험은 사라졌지만, 빈 수집 결과로 의미 없는
-                # 쿼리를 보내지 않기 위해 안전장치는 유지한다.)
+                # 수 있으므로 이 섹션은 스킵합니다.
                 if not crawled:
                     log.warning(f"[{section_name}] 수집된 기사가 없어 데이터 처리를 스킵합니다.")
                     continue
@@ -741,19 +718,19 @@ def main():
                 })
                 existing_links = fetch_existing_links(client, link_id, crawled_pairs)
 
-                # 4. diff → link 신규 INSERT 대상 + sighting_log append 대상 생성
-                new_articles, new_clusters, new_links, sighting_rows = build_link_updates(
+                # 4. diff → link INSERT/UPDATE 대상 생성
+                new_articles, new_clusters, new_links, last_seen_updates = build_link_updates(
                     crawled, existing_links, known_articles, known_clusters, now_str
                 )
 
                 # 5. BigQuery 적재
-                bq_insert(client, cluster_id,  SCHEMA_CLUSTER_MASTER,       new_clusters)
-                bq_insert(client, article_id,  SCHEMA_ARTICLE_MASTER,       new_articles)
-                bq_insert(client, link_id,     SCHEMA_ARTICLE_CLUSTER_LINK, new_links)
-                bq_insert(client, sighting_id, SCHEMA_SIGHTING_LOG,         sighting_rows)
+                bq_insert(client, cluster_id, SCHEMA_CLUSTER_MASTER, new_clusters)
+                bq_insert(client, article_id, SCHEMA_ARTICLE_MASTER, new_articles)
+                bq_insert(client, link_id,    SCHEMA_ARTICLE_CLUSTER_LINK, new_links)
+                bq_update_last_seen(client, link_id, last_seen_updates)
 
-                total_new_links += len(new_links)
-                total_sightings += len(sighting_rows)
+                total_new_links     += len(new_links)
+                total_updated_links += len(last_seen_updates)
 
             except Exception as e:
                 log.error(f"[{section_name}] 예외 발생: {e}", exc_info=True)
@@ -764,7 +741,7 @@ def main():
 
     elapsed = (datetime.now(KST) - start).seconds
     log.info("\n" + "=" * 60)
-    log.info(f"완료: 신규 링크 {total_new_links}건 / sighting_log append {total_sightings}건 / 소요 {elapsed}초")
+    log.info(f"완료: 신규 링크 {total_new_links}건 / last_seen_at 갱신 {total_updated_links}건 / 소요 {elapsed}초")
     log.info("=" * 60)
 
     # [추가] 섹션 처리 중 예외가 있었다면, GitHub Actions가 이 실행을 "실패"로 인식하도록

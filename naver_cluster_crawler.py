@@ -122,10 +122,15 @@ class ClusterMasterRow:
 class ArticleClusterLink:
     """(cluster_id, article_url)를 MERGE로 UPSERT.
     PK: (cluster_id, article_url)
+
+    [수정] initial_rank 컬럼 제거. 네이버 공식 안내("배열 순서는 개인화를
+    반영해 추천, 대표 기사는 구독 언론사 중심으로 제공")와 실측 데이터
+    (30회 관측 중 28~29회 대표 기사가 교체, 1위였던 기사가 이후 50~60위로
+    추락하는 사례 다수)를 근거로, 클러스터 내 노출 순위는 비로그인
+    크롤링으로는 의미 있게 해석할 수 없는 지표로 판단해 수집을 중단했다.
     """
     cluster_id:    str
     article_url:   str
-    initial_rank:  int | None  # 최초 진입 시 순위, 한 번 설정 후 변경 안 됨
     first_seen_at: str         # DATETIME (KST) — 최초로 본 시점, 불변
     last_seen_at:  str         # DATETIME (KST) — 가장 최근에 본 시점, 매번 갱신
 
@@ -155,7 +160,6 @@ SCHEMA_CLUSTER_MASTER = [
 SCHEMA_ARTICLE_CLUSTER_LINK = [
     bigquery.SchemaField("cluster_id",    "STRING",   mode="REQUIRED"),
     bigquery.SchemaField("article_url",   "STRING",   mode="REQUIRED"),
-    bigquery.SchemaField("initial_rank",  "INTEGER"),  # NULLABLE
     bigquery.SchemaField("first_seen_at", "DATETIME", mode="REQUIRED"),
     bigquery.SchemaField("last_seen_at",  "DATETIME", mode="REQUIRED"),
 ]
@@ -228,7 +232,7 @@ def fetch_existing_links(client: bigquery.Client,
     이미 존재하는 것만 조회한다 (비용 최적화 — check_existing_masters()와
     같은 패턴으로 이번 수집 대상만 타겟팅, full scan 안 함).
 
-    반환: { (cluster_id, article_url): { initial_rank, first_seen_at } }
+    반환: { (cluster_id, article_url): { first_seen_at } }
     """
     existing: dict[tuple[str, str], dict] = {}
     if not pairs:
@@ -239,7 +243,7 @@ def fetch_existing_links(client: bigquery.Client,
             f"(cluster_id = '{cid}' AND article_url = '{url}')" for cid, url in chunk
         )
         query = f"""
-            SELECT cluster_id, article_url, initial_rank, first_seen_at
+            SELECT cluster_id, article_url, first_seen_at
             FROM `{link_id}`
             WHERE {pair_conditions}
         """
@@ -247,7 +251,6 @@ def fetch_existing_links(client: bigquery.Client,
             rows = client.query(query).result()
             for row in rows:
                 existing[(row.cluster_id, row.article_url)] = {
-                    "initial_rank":  row.initial_rank,
                     "first_seen_at": row.first_seen_at,
                 }
         except Exception as e:
@@ -545,7 +548,7 @@ def crawl_cluster(page, cluster_id: str, cluster_url: str,
 # ─────────────────────────────────────────────
 def build_link_updates(
     crawled: list[dict],                              # 이번 수집 결과
-    existing_links: dict[tuple[str, str], dict],      # 기존 link { (cid, url): {initial_rank, first_seen_at} }
+    existing_links: dict[tuple[str, str], dict],      # 기존 link { (cid, url): {first_seen_at} }
     known_articles: set[str],                          # article_master 등록 여부
     known_clusters: set[str],                          # cluster_master 등록 여부
     now: str,                                          # DATETIME 문자열 (KST)
@@ -623,7 +626,6 @@ def build_link_updates(
             new_links.append({
                 "cluster_id":    cid,
                 "article_url":   url,
-                "initial_rank":  row["rank"],
                 "first_seen_at": now,
                 "last_seen_at":  now,
             })

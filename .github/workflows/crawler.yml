@@ -38,4 +38,4 @@ jobs:
           BQ_PROJECT:     ${{ secrets.BQ_PROJECT }}
           BQ_DATASET:     naver_cluster
           TARGET_SECTION: ${{ matrix.section }}
-        run: python naver_cluster_crawler.py
+        run: python naver_cluster_crawler_rank.py
